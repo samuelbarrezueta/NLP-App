@@ -1,62 +1,31 @@
 """
 Patch Note Pulse — Streamlit prototype
 ========================================
-This mirrors the exact pipeline built and tested in Patch_Note_Pulse.ipynb:
-Data Dragon (entity dictionary) + LoL Fandom Wiki API (patch text)
--> clean -> split by header -> fuzzy-match entities -> classify buff/nerf/rework
--> optional LLM summary.
+League of Legends Wiki API (patch text) -> clean -> split by champion/item
+entity marker -> classify buff/nerf/rework -> optional LLM summary (Anthropic Claude).
 
 Deploy this on Streamlit Community Cloud (share.streamlit.io) or Hugging Face Spaces.
-Add OPENAI_API_KEY to the platform's Secrets settings before deploying (never hard-code it).
+Add your Anthropic key to the platform's Secrets settings before deploying (never hard-code it).
 """
 
 import re
 import requests
 import pandas as pd
 import streamlit as st
-from rapidfuzz import process, fuzz
 
 # ============================================================
 # CONFIG
 # ============================================================
-DDRAGON_VERSIONS_URL = "https://ddragon.leagueoflegends.com/api/versions.json"
 WIKI_API_URL = "https://wiki.leagueoflegends.com/en-us/api.php"
 REQUEST_HEADERS = {"User-Agent": "PatchNotePulse-StudentProject/1.0 (NLP course project)"}
+ANTHROPIC_SECRET_NAME = "NLP_WORK"
 
 st.set_page_config(page_title="Patch Note Pulse", page_icon="🎮", layout="wide")
 
 
 # ============================================================
-# PHASE 1 — DATA ACQUISITION  (cached so we don't hammer the APIs on every rerun)
+# PHASE 1 — DATA ACQUISITION  (cached so we don't hammer the API on every rerun)
 # ============================================================
-@st.cache_data(ttl=3600)
-def get_available_versions():
-    response = requests.get(DDRAGON_VERSIONS_URL, timeout=15)
-    response.raise_for_status()
-    return response.json()
-
-
-@st.cache_data(ttl=3600)
-def get_champion_data(version):
-    url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/champion.json"
-    response = requests.get(url, timeout=15)
-    response.raise_for_status()
-    return response.json()["data"]
-
-
-@st.cache_data(ttl=3600)
-def get_item_data(version):
-    url = f"https://ddragon.leagueoflegends.com/cdn/{version}/data/en_US/item.json"
-    response = requests.get(url, timeout=15)
-    response.raise_for_status()
-    return response.json()["data"]
-
-
-def ddragon_version_to_patch_label(version_string):
-    parts = version_string.split(".")
-    return f"{parts[0]}.{parts[1]}"
-
-
 @st.cache_data(ttl=3600)
 def get_patch_notes_wikitext(patch_version_label):
     page_title = f"V{patch_version_label}"
@@ -72,54 +41,78 @@ def get_patch_notes_wikitext(patch_version_label):
 # ============================================================
 # PHASE 2 — TEXT PROCESSING
 # ============================================================
+# The wiki formats numbers and names through templates, e.g. {{ci|Aatrox}},
+# {{ai|Infernal Chains|Aatrox}}, {{fd|0.658}}, {{as|3% per 100 AP}}. Some of
+# these nest inside each other (e.g. {{as|{{ap|3*2}}% per 100 AP}}), so we
+# flatten repeatedly until nothing changes, instead of a single pass.
+NAME_TEMPLATE_RE = re.compile(r"\{\{(?:ai|ii|ci|si|sbc|csl|ri|ui|bi|cai|ais|tip)\|([^\{\}\|]+)[^\{\}]*\}\}")
+VALUE_TEMPLATE_RE = re.compile(r"\{\{(?:fd|ap|as|pp|g|gold)\|([^\{\}\|]+)[^\{\}]*\}\}")
+GENERIC_TEMPLATE_RE = re.compile(r"\{\{[^\{\}]*\}\}")
+
+
 def clean_wikitext(raw_text):
-    """Strip the most common wiki markup down to plain, readable text."""
+    """Strip wiki markup down to plain, readable text, keeping numeric values intact."""
     text = raw_text
     text = re.sub(r"<!--.*?-->", "", text, flags=re.DOTALL)
     text = re.sub(r"<ref.*?>.*?</ref>", "", text, flags=re.DOTALL)
     text = re.sub(r"<ref.*?/>", "", text)
     text = re.sub(r"\[\[([^\|\]]+)\|([^\]]+)\]\]", r"\2", text)
     text = re.sub(r"\[\[([^\]]+)\]\]", r"\1", text)
-    text = re.sub(r"\{\{(?:ai|ii|ci|si|sbc)\|([^\}\|]+)[^\}]*\}\}", r"\1", text)
-    text = re.sub(r"\{\{[^\{\}]*\}\}", "", text)
+    for _ in range(8):  # unwind nested templates from the inside out
+        if "{{" not in text:
+            break
+        new_text = NAME_TEMPLATE_RE.sub(r"\1", text)
+        new_text = VALUE_TEMPLATE_RE.sub(r"\1", new_text)
+        new_text = GENERIC_TEMPLATE_RE.sub("", new_text)
+        if new_text == text:
+            break
+        text = new_text
     text = text.replace("'''", "").replace("''", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text
 
 
-HEADER_RE = re.compile(r"^(={2,6})\s*(.+?)\s*\1\s*$", re.MULTILINE)
+# ============================================================
+# PHASE 3 — ENTITY BLOCK SPLITTING
+# ============================================================
+# Current wiki markup doesn't use one "==ChampionName==" header per entity.
+# Instead, inside "=== Champions ===" / "=== Items ===" each entity starts
+# a line of its own: ";{{ci|Aatrox}}" or ";{{ii|Horizon Focus}}". We split
+# on those markers directly, so the entity name is exact (no fuzzy matching
+# needed) and the entity type comes straight from the tag (ci=champion,
+# ii=item).
+SECTION_RE = re.compile(r"^={2,6}\s*(.+?)\s*={2,6}\s*$", re.MULTILINE)
+ENTITY_RE = re.compile(r"^;\{\{(ci|ii)\|([^\{\}\|]+?)(?:\|[^\{\}]*)?\}\}\s*$", re.MULTILINE)
 
 
-def split_into_header_blocks(cleaned_text):
-    matches = list(HEADER_RE.finditer(cleaned_text))
+def get_section_span(text, section_name):
+    """Return the (start, end) character offsets for the body of a top-level section."""
+    headers = list(SECTION_RE.finditer(text))
+    for i, h in enumerate(headers):
+        if h.group(1).strip().lower() == section_name.lower():
+            start = h.end()
+            end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+            return start, end
+    return None, None
+
+
+def split_into_entity_blocks(raw_text):
+    """Find every champion/item change block inside the Champions and Items sections."""
     blocks = []
-    for i, m in enumerate(matches):
-        header_text = m.group(2).strip()
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(cleaned_text)
-        body = cleaned_text[start:end].strip()
-        if body:
-            blocks.append({"header": header_text, "text": body})
+    for section_name, entity_type in [("Champions", "champion"), ("Items", "item")]:
+        start, end = get_section_span(raw_text, section_name)
+        if start is None:
+            continue
+        section_text = raw_text[start:end]
+        markers = list(ENTITY_RE.finditer(section_text))
+        for i, m in enumerate(markers):
+            name = m.group(2).strip()
+            body_start = m.end()
+            body_end = markers[i + 1].start() if i + 1 < len(markers) else len(section_text)
+            body_clean = clean_wikitext(section_text[body_start:body_end]).strip()
+            if body_clean:
+                blocks.append({"entity": name, "entity_type": entity_type, "text": body_clean})
     return blocks
-
-
-# ============================================================
-# PHASE 3 — ENTITY RECOGNITION
-# ============================================================
-QUALIFIER_RE = re.compile(r"\b(buffs?|nerfs?|reworks?|changes?|adjustments?|updates?)\b", re.IGNORECASE)
-
-
-def match_entity(header_text, champion_names, item_names, score_cutoff=85):
-    candidate_text = QUALIFIER_RE.sub("", header_text).strip()
-    if not candidate_text:
-        return None, None
-    combined = champion_names + item_names
-    match = process.extractOne(candidate_text, combined, scorer=fuzz.WRatio, score_cutoff=score_cutoff)
-    if match is None:
-        return None, None
-    name, score, _ = match
-    entity_type = "champion" if name in champion_names else "item"
-    return name, entity_type
 
 
 # ============================================================
@@ -178,19 +171,15 @@ def classify_block(block):
     }
 
 
-def run_pipeline(patch_label, champion_names, item_names):
+def run_pipeline(patch_label):
     raw_text = get_patch_notes_wikitext(patch_label)
-    cleaned = clean_wikitext(raw_text)
-    blocks = split_into_header_blocks(cleaned)
-    for b in blocks:
-        b["entity"], b["entity_type"] = match_entity(b["header"], champion_names, item_names)
-    entity_blocks = [b for b in blocks if b["entity"] is not None]
-    classified = [classify_block(b) for b in entity_blocks]
+    blocks = split_into_entity_blocks(raw_text)
+    classified = [classify_block(b) for b in blocks]
     return pd.DataFrame(classified)
 
 
 # ============================================================
-# PHASE 5 — LLM SUMMARY (optional — only runs if an OpenAI key is configured)
+# PHASE 5 — LLM SUMMARY (optional — only runs if an Anthropic key is configured)
 # ============================================================
 def build_prompt(patch_df, patch_label):
     rows = [
@@ -209,18 +198,18 @@ def build_prompt(patch_df, patch_label):
 
 
 def generate_patch_summary(patch_df, patch_label):
-    from openai import OpenAI
-    api_key = st.secrets.get("OPENAI_API_KEY", None)
+    import anthropic
+    api_key = st.secrets.get(ANTHROPIC_SECRET_NAME, None)
     if not api_key:
         return None
-    client = OpenAI(api_key=api_key)
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": build_prompt(patch_df, patch_label)}],
+    client = anthropic.Anthropic(api_key=api_key)
+    response = client.messages.create(
+        model="claude-sonnet-5",
+        max_tokens=250,
         temperature=0.5,
-        max_tokens=250
+        messages=[{"role": "user", "content": build_prompt(patch_df, patch_label)}],
     )
-    return response.choices[0].message.content.strip()
+    return response.content[0].text.strip()
 
 
 # ============================================================
@@ -229,25 +218,18 @@ def generate_patch_summary(patch_df, patch_label):
 st.title("🎮 Patch Note Pulse")
 st.caption("Turns a wall of League of Legends balance jargon into a 30-second digest.")
 
-with st.spinner("Loading champion/item dictionary from Data Dragon..."):
-    all_versions = get_available_versions()
-    latest_version = all_versions[0]
-    champions_raw = get_champion_data(latest_version)
-    items_raw = get_item_data(latest_version)
-    champion_names = sorted([c["name"] for c in champions_raw.values()])
-    item_names = sorted([i["name"] for i in items_raw.values()])
 patch_label = st.text_input(
-        "Patch version to analyze (e.g. 26.14)",
-        value="26.14",
-        help="Riot renamed patches to a year.patch format in 2025 (e.g. 26.14 = 2026, patch 14). "
-             "Data Dragon's internal client version no longer matches this — type the patch label "
-             "exactly as shown on leagueoflegends.com's official patch notes page."
+    "Patch version to analyze (e.g. 26.14)",
+    value="26.14",
+    help="Riot renamed patches to a year.patch format in 2025 (e.g. 26.14 = 2026, patch 14). "
+         "Data Dragon's internal client version no longer matches this — type the patch label "
+         "exactly as shown on leagueoflegends.com's official patch notes page."
 )
 
 if st.button("Analyze patch", type="primary"):
     try:
         with st.spinner(f"Pulling and analyzing patch {patch_label}..."):
-            patch_df = run_pipeline(patch_label, champion_names, item_names)
+            patch_df = run_pipeline(patch_label)
 
         if patch_df.empty:
             st.warning("No champion/item changes were detected for this patch. Try a different label.")
@@ -257,7 +239,7 @@ if st.button("Analyze patch", type="primary"):
                 st.subheader("📝 What this patch means")
                 st.write(summary)
             else:
-                st.info("Add OPENAI_API_KEY in this app's Secrets to enable the LLM summary paragraph.")
+                st.info(f"Add your Anthropic key as '{ANTHROPIC_SECRET_NAME}' in this app's Secrets to enable the LLM summary paragraph.")
 
             st.subheader("📊 Buff vs. Nerf breakdown")
             counts = patch_df["classification"].value_counts()
@@ -277,12 +259,12 @@ if st.button("Analyze patch", type="primary"):
 
             with st.expander("How this works"):
                 st.write(
-                    "Champion/item names come from Riot's Data Dragon API. Patch note text comes "
-                    "from the League of Legends Fandom Wiki API. The text is cleaned, split by "
-                    "section header, matched against the champion/item dictionary (fuzzy matching "
-                    "via rapidfuzz), then each change line is classified as a buff or nerf based on "
-                    "which stat changed and in which direction. An LLM (if configured) turns the "
-                    "structured result into a plain-English summary."
+                    "Patch note text comes from the official League of Legends Wiki API. The text is "
+                    "split into one block per champion/item using the wiki's own entity markers "
+                    "(so names and types come straight from the source, no guesswork), then each "
+                    "change line is classified as a buff or nerf based on which stat changed and in "
+                    "which direction. An LLM (if configured) turns the structured result into a "
+                    "plain-English summary."
                 )
     except ValueError as e:
         st.error(f"{e}\n\nTry a different patch label — not every patch has its own wiki page.")
