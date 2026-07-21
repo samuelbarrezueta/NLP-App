@@ -20,7 +20,7 @@ from rapidfuzz import process, fuzz
 # CONFIG
 # ============================================================
 DDRAGON_VERSIONS_URL = "https://ddragon.leagueoflegends.com/api/versions.json"
-WIKI_API_URL = "https://leagueoflegends.fandom.com/api.php"
+WIKI_API_URL = "https://wiki.leagueoflegends.com/en-us/api.php"
 REQUEST_HEADERS = {"User-Agent": "PatchNotePulse-StudentProject/1.0 (NLP course project)"}
 
 st.set_page_config(page_title="Patch Note Pulse", page_icon="🎮", layout="wide")
@@ -236,13 +236,12 @@ with st.spinner("Loading champion/item dictionary from Data Dragon..."):
     items_raw = get_item_data(latest_version)
     champion_names = sorted([c["name"] for c in champions_raw.values()])
     item_names = sorted([i["name"] for i in items_raw.values()])
-
-default_label = ddragon_version_to_patch_label(latest_version)
 patch_label = st.text_input(
-    "Patch version to analyze (e.g. 14.14)",
-    value="14.14",
-    help=f"Data Dragon's newest version ({latest_version}) maps to '{default_label}', "
-         f"but very recent patches may not have a wiki page yet — try an older label if it 404s."
+        "Patch version to analyze (e.g. 26.14)",
+        value="26.14",
+        help="Riot renamed patches to a year.patch format in 2025 (e.g. 26.14 = 2026, patch 14). "
+             "Data Dragon's internal client version no longer matches this — type the patch label "
+             "exactly as shown on leagueoflegends.com's official patch notes page."
 )
 
 if st.button("Analyze patch", type="primary"):
