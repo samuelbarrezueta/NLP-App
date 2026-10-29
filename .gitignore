@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Notebooks
+.ipynb_checkpoints/
+patch_pulse_cache/
+
+# Secrets: never commit real keys
+.streamlit/secrets.toml
+.env
+
+# OS / editors
+.DS_Store
+.vscode/
+.idea/
